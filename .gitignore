@@ -1,8 +1,5 @@
 .idea
 
-# Non-distributal (https://github.com/oblitum/Interception/releases)
-install-interception.exe
-
 # Created by http://www.gitignore.io
 ### OSX ###
 .DS_Store

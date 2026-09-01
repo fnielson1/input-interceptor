@@ -6,7 +6,9 @@ rem alternative to buildit.cmd, which needs the legacy WDK build environment
 rem (%WDK%\bin\setenv) that no longer ships with current kits.
 rem
 rem interceptor.c calls no CRT function, so this links /NODEFAULTLIB against
-rem kernel32 alone: no msvcrt import, no VC++ redistributable requirement.
+rem kernel32 and user32 alone (the latter for SetWindowsHookEx/RegisterRaw-
+rem InputDevices/SendInput): no msvcrt import, no VC++ redistributable
+rem requirement.
 rem
 rem   /GS-          no stack cookie (would pull __security_check_cookie from the CRT)
 rem   /Gs1000000    no stack probe (__chkstk likewise); frames here are well under 4K
@@ -61,7 +63,7 @@ rc /nologo /fo "%OUTDIR%\interceptor.res" interceptor-standalone.rc
 if errorlevel 1 goto :failed
 
 echo Linking...
-link /nologo /DLL /NODEFAULTLIB /ENTRY:DllMain /OPT:REF /OPT:ICF /OUT:"%OUTDIR%\interceptor.dll" /IMPLIB:"%OUTDIR%\interceptor.lib" "%OUTDIR%\interceptor.obj" "%OUTDIR%\dllmain.obj" "%OUTDIR%\interceptor.res" kernel32.lib
+link /nologo /DLL /NODEFAULTLIB /ENTRY:DllMain /OPT:REF /OPT:ICF /OUT:"%OUTDIR%\interceptor.dll" /IMPLIB:"%OUTDIR%\interceptor.lib" "%OUTDIR%\interceptor.obj" "%OUTDIR%\dllmain.obj" "%OUTDIR%\interceptor.res" kernel32.lib user32.lib
 if errorlevel 1 goto :failed
 
 popd

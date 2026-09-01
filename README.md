@@ -1,70 +1,69 @@
 # input-interceptor
 
 A user-mode C library for intercepting, filtering, and synthesising keyboard and
-mouse input on Windows at the device level, below the Win32 input stack.
-
-
-Because it works at the driver level rather than through `SetWindowsHookEx`, it
-sees input that hooks cannot (DirectInput/raw-input games, the console) and its
-synthesised strokes are indistinguishable from real hardware to everything above
-the driver.
+mouse input on Windows.
 
 ## Requirements
 
-**A kernel driver must be built and installed separately.** This repository
-now ships its own driver source under [`driver/`](driver/) — an original
-implementation of the same `\\.\interception00`..`19` wire protocol
-`src/interceptor.c` speaks, not a copy of or a runtime dependency on any
-third-party driver. Without it installed, `interceptor_create_context()`
-returns `0` and nothing works.
+None beyond the DLL itself — **no kernel driver, no driver signing, no
+test-signing mode, no reboot.** `src/interceptor.c` is implemented entirely on
+top of three ordinary Win32 mechanisms: Raw Input (`RegisterRawInputDevices`/
+`WM_INPUT`) to tell physical keyboards and mice apart, `WH_KEYBOARD_LL`/
+`WH_MOUSE_LL` low-level hooks to withhold a stroke from the rest of the system,
+and `SendInput` to release or synthesise one. `interceptor_create_context()`
+spins up a small internal worker thread (a hidden message-only window, the two
+Raw Input registrations, the two hooks) on first use and tears it down once the
+last context is destroyed — nothing else to install.
 
-Building it needs the **Windows Driver Kit** (the "Windows Driver Kit" Visual
-Studio component, matching your installed SDK version, or the standalone WDK
-installer from Microsoft) in addition to the C++ x64 toolset `src\build-msvc.cmd`
-already needs — unlike the DLL, kernel code has no WDK-free build path. Then:
+A kernel-driver implementation of this same API still exists on the [`driver`
+branch](../../tree/driver), for anything that specifically needs a synthesised
+stroke to be indistinguishable from real hardware (see "Trade-offs" below) —
+that version needs the Windows Driver Kit, test-signing, and a reboot, as before.
 
-```
-driver\build-wdk.cmd
-```
+### Trade-offs versus the driver branch
 
-Output lands in `driver\build\x64\Debug\`: `interceptor-driver.sys`,
-`interceptor-driver.inf`, `interceptor-driver.cat`, `interceptor-driver.cer`.
-Install it from an **elevated** command prompt:
+This library's public API ([`src/interceptor.h`](src/interceptor.h)) is
+identical either way, but the user-mode backend gives up a few things the
+kernel driver had:
 
-```
-driver\install-wdk.cmd
-```
+- **A released stroke carries Windows' injected-input marker permanently.**
+  Anything `interceptor_send()` releases goes through `SendInput`, which
+  stamps `LLKHF_INJECTED`/`LLMHF_INJECTED` on the event; nothing in user mode
+  can clear it. Code that checks for that flag (some anti-cheat, some other
+  input tools) can tell it apart from real hardware. The driver branch's
+  reinjected strokes, synthesized below the class driver, carry no such marker.
+- **Exclusive-mode DirectInput/raw-HID-only games, the secure desktop** (UAC
+  consent, Ctrl+Alt+Del), **and the console** can bypass both Raw Input and
+  low-level hooks entirely, since neither taps in below the Win32 input stack.
+- **`INTERCEPTOR_FILTER_KEY_TERMSRV_*` filter bits never match locally** —
+  those only arise inside an actual Remote Desktop session's keyboard stack,
+  which isn't visible to either mechanism this backend uses.
+- **Precedence only orders opens within this process.** The driver could
+  arbitrate multiple simultaneous processes system-wide; nothing in user mode
+  can override the order Windows itself calls different processes' low-level
+  hooks in.
+- **Device-slot assignment doesn't survive unplug/replug.** A slot is bound to
+  a Raw Input device handle for the life of the process and never freed, so
+  reconnecting a keyboard or mouse consumes a new slot rather than rebinding
+  to its old one. The driver binds by persistent PnP instance ID, which does
+  survive a replug.
+- `interceptor_get_hardware_id()` returns the Raw Input device interface path
+  (e.g. `\\?\HID#VID_046D&PID_C52B&...`) rather than the driver's bare PnP
+  hardware ID string. `VID_`/`PID_` substrings are present for USB HID
+  devices either way, but exact-string comparisons against IDs captured from
+  the driver build will need updating.
 
-This enables test-signing mode if it isn't already on (`bcdedit /set
-testsigning on` — a locally built driver is not release-signed, so it will
-only load with test-signing enabled), imports the build's test certificate
-into Trusted Root/Trusted Publishers, and runs `pnputil /add-driver ...
-/install`. **Reboot** afterwards — required if test-signing just got turned
-on, and recommended regardless so the class filter attaches to your
-existing keyboard/mouse.
+For remapping, accessibility, and automation on a normal desktop session — this
+library's stated use case — none of the above usually matters. See
+[`src/interceptor.c`](src/interceptor.c)'s file header for the full architecture
+writeup, including why the Raw Input/hook correlation is best-effort and fails
+open (passes an event through unfiltered) rather than misattributing or losing
+it.
 
-To remove it later, from an elevated prompt:
-
-```
-driver\uninstall-wdk.cmd
-```
-
-which unpublishes the driver package and reminds you to `bcdedit /set
-testsigning off` (then reboot) once you're done developing against it.
-
-Note this is a system-wide keyboard/mouse class filter: it loads at boot for
-every keyboard/mouse Windows enumerates, before anyone logs in, so a bad
-build can leave input non-functional until you boot into Safe Mode
-(third-party filters don't load there) or a recovery prompt to remove it.
-
-> The driver publishes its device objects as `\\.\interception00` … `\\.\interception19`.
-> That name is part of the wire protocol between this library and the driver, so
-> [`src/interceptor.c`](src/interceptor.c) still opens `\\.\interception##`
-> verbatim. It is deliberately *not* renamed and must stay that way.
-
-Also note the usual filter-driver caveat: a process using this library only
-receives input destined for processes at its own integrity level or lower, so to
-intercept input to an elevated application you must run elevated yourself.
+Also note the usual UIPI caveat: a process using this library only reliably
+sees and can suppress input destined for windows at its own integrity level or
+lower, so to intercept input to an elevated application you must run elevated
+yourself.
 
 ## Building the library
 
@@ -216,18 +215,18 @@ port:
 | `interception.h` / `.c` / `.dll` / `.lib` | `interceptor.h` / `.c` / `.dll` / `.lib` |
 
 Porting existing code is a case-sensitive search and replace of `interception`
-→ `interceptor` in those three casings. Semantics, struct layouts, filter bit
-values, and the wire protocol to the driver match, so a program ported this
-way behaves identically. `src/`, `driver/`, and `samples/` here are all
-original implementations of that same public API and `\\.\interceptionNN`
-wire protocol — see [License](#license) — not a derivative port of that
-project's actual source. (The one sample with a distinct, separately-credited
-origin is `caps2esc`, ported from a different, unrelated upstream project —
-see its own table entry and file header.)
+→ `interceptor` in those three casings. Semantics, struct layouts, and filter
+bit values match, so a program ported this way behaves identically. `src/`
+and `samples/` here are original implementations of that same public API —
+see [License](#license) — not a derivative port of that project's actual
+source. (The one sample with a distinct, separately-credited origin is
+`caps2esc`, ported from a different, unrelated upstream project — see its own
+table entry and file header.)
 
-The one string that is **not** renamed from that API is the driver device
-path `\\.\interception00`, since it is the wire-protocol contract with the
-separately built/installed kernel driver in [`driver/`](driver/).
+Unlike that project (and unlike this repository's own [`driver`
+branch](../../tree/driver)), `main` speaks no `\\.\interceptionNN` device
+wire protocol at all — see "Requirements" above for the Raw Input/hook/
+SendInput backend `src/interceptor.c` uses instead.
 
 This repository also adds `src\build-msvc.cmd` and `src\interceptor-standalone.rc`
 for building with a current Visual Studio toolchain without the WDK, and
@@ -238,7 +237,7 @@ for building with a current Visual Studio toolchain without the WDK, and
 ```
 src/                         the library
   interceptor.h                public API
-  interceptor.c                implementation (talks to the driver via DeviceIoControl)
+  interceptor.c                implementation (Raw Input + WH_KEYBOARD_LL/WH_MOUSE_LL + SendInput)
   dllmain.c                    entry point for the standalone MSVC build
   interceptor.rc               version resource (WDK build)
   interceptor-standalone.rc    version resource (MSVC build)
@@ -246,40 +245,35 @@ src/                         the library
   buildit.cmd                  legacy WDK build, x86
   buildit-x64.cmd              legacy WDK build, x64
   sources, makefile            WDK build definitions
-driver/                      the kernel driver (original implementation, no oblitum dependency)
-  protocol.h                   IOCTL codes + filter bits, kept in lockstep with src/interceptor.c
-  driver.h, driver.c           DriverEntry/Unload, the 20 permanent \\.\interceptionNN control devices
-  pnp.c                        PnP AddDevice / slot binding for each physical keyboard or mouse
-  connect.c                    CONNECT_DATA hook that captures real hardware strokes
-  dispatch.c                   the 8 IOCTLs (SET/GET_PRECEDENCE, SET/GET_FILTER, SET_EVENT, READ, WRITE, GET_HARDWARE_ID)
-  queue.c                      per-open stroke queues and precedence-ordered delivery
-  interceptor-driver.inf       class-filter install (LowerFilters on the keyboard/mouse classes)
-  interceptor-driver.vcxproj   modern WDK MSBuild driver project
-  build-wdk.cmd                modern Visual Studio + WDK build
 samples/                     example filters, one per directory
 tools/scd.cmd                short-path cd helper used by the WDK build scripts
 ```
+
+The kernel-driver backend (`driver/`, plus `protocol.h`'s IOCTL codes and the
+`\\.\interceptionNN` control devices) lives only on the [`driver`
+branch](../../tree/driver), not on `main`.
 
 ## Legal and safety
 
 This library intercepts and synthesises input system-wide. Use it on machines
 you control, for input remapping, accessibility, and automation. Note that
-anti-cheat and endpoint-security products commonly flag or block input filter
-drivers, and some online games treat them as a terms-of-service violation.
+anti-cheat and endpoint-security products commonly flag or block low-level
+input hooks and filter drivers alike, and some online games treat them as a
+terms-of-service violation.
 
 ## License
 
 MIT — see [LICENSE](LICENSE) — for the whole repository.
 
-`src/`, `driver/`, and `samples/` are original implementations of the public
-API and `\\.\interceptionNN` wire protocol popularized by
-[Interception](https://github.com/oblitum/Interception), written without
-reference to that project's actual source: `driver/` because that project's
-kernel driver source has never been published under any license (it's
-offered only as a compiled binary, with source access sold separately as a
-commercial license); `src/` and `samples/` as clean-room rewrites — fresh
-implementations written from functional specifications of the API, wire
-protocol, and each sample's documented behavior only, by someone who had not
+`src/` and `samples/` (this branch), and `driver/` (the [`driver`
+branch](../../tree/driver)), are original implementations of the public API
+popularized by [Interception](https://github.com/oblitum/Interception),
+written without reference to that project's actual source: `driver/` because
+that project's kernel driver source has never been published under any
+license (it's offered only as a compiled binary, with source access sold
+separately as a commercial license); `src/` and `samples/` as clean-room
+rewrites — fresh implementations written from functional specifications of
+the API and each sample's documented behavior only, by someone who had not
 seen that project's actual (LGPL-3.0-licensed) library or sample source.
 None of these are a derivative of that project's code. The one exception is
 `samples/caps2esc`, whose *remapping concept* (not its code) is credited to

@@ -171,6 +171,25 @@ InterceptorFilter INTERCEPTOR_API interceptor_get_filter(InterceptorContext cont
 
 void INTERCEPTOR_API interceptor_set_filter(InterceptorContext context, InterceptorPredicate predicate, InterceptorFilter filter);
 
+/*
+ * interceptor_set_filter's passive counterpart, and not part of upstream
+ * Interception's API: a device matching a monitor filter is still delivered
+ * to the rest of the system -- a copy is *also* queued here for
+ * interceptor_receive, but nothing is withheld the way interceptor_set_filter
+ * withholds a match.
+ *
+ * Exists so a caller that already holds a context never needs its own raw
+ * input registration for devices it isn't capturing. Windows allows only one
+ * raw-input registration per device class per process (a second one silently
+ * steals delivery from the first -- see src/interceptor.c's file header and
+ * InterceptorEnumerateExistingDevices for the registration this shares), so
+ * anything that wants to pick up motion from mice it is not filtering should
+ * use this rather than RegisterRawInputDevices of its own.
+ */
+InterceptorFilter INTERCEPTOR_API interceptor_get_monitor(InterceptorContext context, InterceptorDevice device);
+
+void INTERCEPTOR_API interceptor_set_monitor(InterceptorContext context, InterceptorPredicate predicate, InterceptorFilter filter);
+
 InterceptorDevice INTERCEPTOR_API interceptor_wait(InterceptorContext context);
 
 InterceptorDevice INTERCEPTOR_API interceptor_wait_with_timeout(InterceptorContext context, unsigned long milliseconds);
