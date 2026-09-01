@@ -579,6 +579,10 @@ static HHOOK g_MouseHook = NULL;
 static HANDLE g_EngineReadyEvent = NULL;
 static BOOL g_EngineStartFailed = FALSE;
 
+/* Most recent real (non-injected) mouse device seen via WM_INPUT. Engine-
+   thread-only -- see InterceptorHandleRawInput and InterceptorMouseHookProc. */
+static INTERCEPTOR_SLOT *g_LastRealMouseSlot = NULL;
+
 static const WCHAR INTERCEPTOR_WNDCLASS[] = L"InterceptorEngineWindow";
 
 static void InterceptorHandleRawInput(HRAWINPUT hRawInput)
@@ -633,21 +637,37 @@ static void InterceptorHandleRawInput(HRAWINPUT hRawInput)
 
         if (slot != NULL)
         {
-            INTERCEPTOR_PENDING_ENTRY entry;
-            InterceptorRawMouseStroke *mouseRaw = (InterceptorRawMouseStroke *)entry.Data;
+            /* Engine-thread-only (WM_INPUT and the hook below both run on this
+               thread's message pump); read by the button/wheel branch of
+               InterceptorMouseHookProc when a HID report combining motion with
+               a button/wheel change splits into more hook calls than this one
+               WM_INPUT -- see that function. */
+            g_LastRealMouseSlot = slot;
 
-            entry.Slot = slot;
-            entry.StartAfter = NULL;
-            mouseRaw->UnitId = 0;
-            mouseRaw->Flags = raw->data.mouse.usFlags;
-            mouseRaw->ButtonFlags = raw->data.mouse.usButtonFlags;
-            mouseRaw->ButtonData = raw->data.mouse.usButtonData;
-            mouseRaw->RawButtons = raw->data.mouse.ulRawButtons;
-            mouseRaw->LastX = raw->data.mouse.lLastX;
-            mouseRaw->LastY = raw->data.mouse.lLastY;
-            mouseRaw->ExtraInformation = raw->data.mouse.ulExtraInformation;
+            if (raw->data.mouse.lLastX != 0 || raw->data.mouse.lLastY != 0)
+            {
+                /* Only the motion half of this report. A simultaneous button
+                   or wheel change in the same HID report is a *separate* low-
+                   level hook invocation -- Windows splits a combined report
+                   into one legacy message per logical sub-event -- delivered
+                   by InterceptorMouseHookProc's wParam-driven branch instead,
+                   never from here, or it would be double-delivered. */
+                INTERCEPTOR_PENDING_ENTRY entry;
+                InterceptorRawMouseStroke *mouseRaw = (InterceptorRawMouseStroke *)entry.Data;
 
-            InterceptorPendingPush(&g_RealMousePending, &entry);
+                entry.Slot = slot;
+                entry.StartAfter = NULL;
+                mouseRaw->UnitId = 0;
+                mouseRaw->Flags = raw->data.mouse.usFlags;
+                mouseRaw->ButtonFlags = 0;
+                mouseRaw->ButtonData = 0;
+                mouseRaw->RawButtons = 0;
+                mouseRaw->LastX = raw->data.mouse.lLastX;
+                mouseRaw->LastY = raw->data.mouse.lLastY;
+                mouseRaw->ExtraInformation = raw->data.mouse.ulExtraInformation;
+
+                InterceptorPendingPush(&g_RealMousePending, &entry);
+            }
         }
     }
 
@@ -687,19 +707,87 @@ static LRESULT CALLBACK InterceptorKeyboardHookProc(int code, WPARAM wParam, LPA
     return CallNextHookEx(NULL, code, wParam, lParam);
 }
 
+/*
+ * A HID report combining motion with a button/wheel change splits, on the way
+ * to this hook, into one legacy Win32 message per logical sub-event -- a
+ * WM_MOUSEMOVE call and a WM_LBUTTONDOWN call from a single WM_INPUT, for
+ * instance. wParam says which message this particular call is, so button/
+ * wheel events are built directly from it (plus MSLLHOOKSTRUCT.mouseData/
+ * dwExtraInfo) rather than by popping the raw-input queue a second time for
+ * a report that only ever pushed one entry -- popping again would find it
+ * empty and fail open, letting the button through unfiltered. Device
+ * identity for these comes from g_LastRealMouseSlot instead of a queue,
+ * since there is nothing left in the queue to carry it.
+ */
 static LRESULT CALLBACK InterceptorMouseHookProc(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code == HC_ACTION)
     {
         const MSLLHOOKSTRUCT *info = (const MSLLHOOKSTRUCT *)lParam;
         BOOL injected = (info->flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED)) != 0;
-        INTERCEPTOR_PENDING_QUEUE *queue = injected ? &g_InjectedMousePending : &g_RealMousePending;
-        INTERCEPTOR_PENDING_ENTRY entry;
 
-        UNREFERENCED_PARAMETER(wParam);
+        if (injected)
+        {
+            INTERCEPTOR_PENDING_ENTRY entry;
 
-        if (InterceptorPendingPop(queue, &entry) && InterceptorDeliverStroke(entry.Slot, entry.StartAfter, entry.Data))
-            return 1;
+            if (InterceptorPendingPop(&g_InjectedMousePending, &entry) &&
+                InterceptorDeliverStroke(entry.Slot, entry.StartAfter, entry.Data))
+                return 1;
+        }
+        else if (wParam == WM_MOUSEMOVE)
+        {
+            INTERCEPTOR_PENDING_ENTRY entry;
+
+            if (InterceptorPendingPop(&g_RealMousePending, &entry) &&
+                InterceptorDeliverStroke(entry.Slot, NULL, entry.Data))
+                return 1;
+        }
+        else if (g_LastRealMouseSlot != NULL)
+        {
+            InterceptorRawMouseStroke raw;
+            BOOL known = TRUE;
+
+            raw.UnitId = 0;
+            raw.Flags = 0;
+            raw.ButtonFlags = 0;
+            raw.ButtonData = 0;
+            raw.RawButtons = 0;
+            raw.LastX = 0;
+            raw.LastY = 0;
+            raw.ExtraInformation = (unsigned long)info->dwExtraInfo;
+
+            switch (wParam)
+            {
+            case WM_LBUTTONDOWN: raw.ButtonFlags = INTERCEPTOR_MOUSE_LEFT_BUTTON_DOWN; break;
+            case WM_LBUTTONUP:   raw.ButtonFlags = INTERCEPTOR_MOUSE_LEFT_BUTTON_UP; break;
+            case WM_RBUTTONDOWN: raw.ButtonFlags = INTERCEPTOR_MOUSE_RIGHT_BUTTON_DOWN; break;
+            case WM_RBUTTONUP:   raw.ButtonFlags = INTERCEPTOR_MOUSE_RIGHT_BUTTON_UP; break;
+            case WM_MBUTTONDOWN: raw.ButtonFlags = INTERCEPTOR_MOUSE_MIDDLE_BUTTON_DOWN; break;
+            case WM_MBUTTONUP:   raw.ButtonFlags = INTERCEPTOR_MOUSE_MIDDLE_BUTTON_UP; break;
+            case WM_XBUTTONDOWN:
+                raw.ButtonFlags = (HIWORD(info->mouseData) == XBUTTON2)
+                    ? INTERCEPTOR_MOUSE_BUTTON_5_DOWN : INTERCEPTOR_MOUSE_BUTTON_4_DOWN;
+                break;
+            case WM_XBUTTONUP:
+                raw.ButtonFlags = (HIWORD(info->mouseData) == XBUTTON2)
+                    ? INTERCEPTOR_MOUSE_BUTTON_5_UP : INTERCEPTOR_MOUSE_BUTTON_4_UP;
+                break;
+            case WM_MOUSEWHEEL:
+                raw.ButtonFlags = INTERCEPTOR_MOUSE_WHEEL;
+                raw.ButtonData = (unsigned short)(short)HIWORD(info->mouseData);
+                break;
+            case WM_MOUSEHWHEEL:
+                raw.ButtonFlags = INTERCEPTOR_MOUSE_HWHEEL;
+                raw.ButtonData = (unsigned short)(short)HIWORD(info->mouseData);
+                break;
+            default:
+                known = FALSE;
+                break;
+            }
+
+            if (known && InterceptorDeliverStroke(g_LastRealMouseSlot, NULL, (const unsigned char *)&raw))
+                return 1;
+        }
     }
 
     return CallNextHookEx(NULL, code, wParam, lParam);
@@ -1189,8 +1277,48 @@ int INTERCEPTOR_API interceptor_send(InterceptorContext context, InterceptorDevi
 
         if (isMouse)
         {
-            InterceptorMouseStrokesToRaw(&stroke[i], 1, (InterceptorRawMouseStroke *)rawData);
-            InterceptorBuildMouseInput((const InterceptorRawMouseStroke *)rawData, &input);
+            InterceptorRawMouseStroke *mouseRaw = (InterceptorRawMouseStroke *)rawData;
+
+            InterceptorMouseStrokesToRaw(&stroke[i], 1, mouseRaw);
+
+            if (mouseRaw->ButtonFlags != 0 && (mouseRaw->LastX != 0 || mouseRaw->LastY != 0))
+            {
+                /* SendInput splits a combined MOUSEEVENTF_MOVE + button/wheel
+                   flag into separate legacy messages the same way real
+                   hardware does (see InterceptorMouseHookProc), so this is
+                   released as two independent strokes/SendInput calls rather
+                   than risk a second, unmatched hook invocation finding the
+                   pending queue empty. */
+                InterceptorRawMouseStroke motionOnly = *mouseRaw;
+                InterceptorRawMouseStroke buttonOnly = *mouseRaw;
+                INPUT motionInput, buttonInput;
+                BOOL sentAny = FALSE;
+
+                motionOnly.ButtonFlags = 0;
+                motionOnly.ButtonData = 0;
+                buttonOnly.LastX = 0;
+                buttonOnly.LastY = 0;
+
+                InterceptorBuildMouseInput(&motionOnly, &motionInput);
+                InterceptorBuildMouseInput(&buttonOnly, &buttonInput);
+
+                entry.Slot = open->Slot;
+                entry.StartAfter = open;
+                CopyMemory(entry.Data, &motionOnly, sizeof(motionOnly));
+                InterceptorPendingPush(&g_InjectedMousePending, &entry);
+                if (SendInput(1, &motionInput, sizeof(INPUT)) == 1) sentAny = TRUE;
+
+                entry.Slot = open->Slot;
+                entry.StartAfter = open;
+                CopyMemory(entry.Data, &buttonOnly, sizeof(buttonOnly));
+                InterceptorPendingPush(&g_InjectedMousePending, &entry);
+                if (SendInput(1, &buttonInput, sizeof(INPUT)) == 1) sentAny = TRUE;
+
+                if (sentAny) accepted++;
+                continue;
+            }
+
+            InterceptorBuildMouseInput(mouseRaw, &input);
         }
         else
         {
